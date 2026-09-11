@@ -1,0 +1,23 @@
+- insert:
+    - id: hello
+      name: '/simple/works/ai/deepseek-harness/dsh-cmis-agent/src/hello.ts'
+    - id: cmis-context
+      name: '/simple/works/ai/deepseek-harness/dsh-cmis-agent/src/context/index.ts'
+      config:
+        centerServer: 'https://app.simpleinfo.cn/'
+        centerAuthorization: 'Basic OTAwMTpFQjI2MUJFREU0MEM4OTQ5MjA0RUY4NzBDNjBGNDk4RkJENjEyOTQ5QjBFOTY4OEIyMUQzRjUyMjAwNTI1RjEyMjJDNDQxMUE3MjVEMEIxNg=='
+    - id: cmis-gateway
+      name: '/simple/works/ai/deepseek-harness/dsh-cmis-agent/src/gateway/index.ts'
+      config:
+        port: 3001
+        path: '/agent'
+        heartbeatIntervalMs: 30000
+        sessionRetentionMs: 600000
+        speech:
+            appId: 'da7a76b6'
+            apiKey: 'e28fb64fe33b9403e8961a763c1fb1a5'
+            apiSecret: 'N2UyNzNiZmM5ZmUwNTZkOGEwZjhkMjQ3'
+    - id: cmis-report-tools
+      name: '/simple/works/ai/deepseek-harness/dsh-cmis-agent/src/report-tools/index.ts'
+    - id: cmis-feishu
+      name: '/simple/works/ai/deepseek-harness/dsh-cmis-agent/src/feishu/index.ts'

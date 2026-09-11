@@ -1,0 +1,341 @@
+import { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent-default-model'
+import z from '@deepseek-ai/schemastery'
+import http from 'node:http'
+import { WebSocketServer, WebSocket } from 'ws'
+import { authenticate, AuthError, readCredentials } from './auth.ts'
+import { buildSessionId, SessionDriver } from './bridge.ts'
+import type { TurnConnection } from './bridge.ts'
+import { XfyunRealtimeAsr } from './speech.ts'
+import type { SpeechRecognition, XfyunCredential } from './speech.ts'
+import type { ClientRequest, ClientSpeechControl, RequestId, ServerEvent } from './types.ts'
+import type { CmisContext } from '../context/index.ts'
+
+export const name = 'cmis-gateway'
+export const inject = ['cmisContext', 'agents', 'agentDefaultModel']
+
+export const defaultWelcomeText = `欢迎使用信步AI报表助手！我是您的智能报表查询助手。
+
+您可以通过文字告诉我想看的报表，例如"查一下上周的滞销品报表"。
+也可以让我列出可用的报表清单。`
+
+export interface Config {
+    /** gateway WS 监听端口 */
+    port: number
+    /** WS 路径（终端连接地址 ws://host:port<path>） */
+    path: string
+    /** 欢迎文案 */
+    welcomeText: string
+    /** 心跳推送间隔（毫秒，0 关闭） */
+    heartbeatIntervalMs: number
+    /** 断开后会话保留时长（毫秒，超时且无重连则销毁 agent；0 表示不销毁） */
+    sessionRetentionMs: number
+    /** 讯飞实时转写凭证（不配置则语音输入不可用） */
+    speech?: XfyunCredential
+}
+
+export const Config: z<Config> = z.object({
+    port: z.natural().default(3000).description('gateway WS 监听端口'),
+    path: z.string().default('/agent').description('WS 路径'),
+    welcomeText: z.string().role('textarea').default(defaultWelcomeText).description('欢迎文案'),
+    heartbeatIntervalMs: z.natural().default(30000).description('心跳推送间隔（毫秒，0 关闭）'),
+    sessionRetentionMs: z.natural().default(600000).description('断开后会话保留时长（毫秒，超时无重连销毁 agent，0 不销毁）'),
+    speech: z.object({
+        appId: z.string().required().description('讯飞应用 App ID'),
+        apiKey: z.string().required().description('讯飞 Access Key ID'),
+        apiSecret: z.string().required().description('讯飞 Access Key Secret'),
+    }).description('讯飞实时转写凭证（不配置则语音输入不可用）'),
+})
+
+/** 终端连接：鉴权通过后的会话级状态 */
+class GatewayConnection implements TurnConnection {
+    /** 活跃语音识别器（连接级，一次一个录音会话） */
+    speechRecognizer?: SpeechRecognition
+    /** 当前语音会话（识别完成后按此提交对话） */
+    activeSpeech?: { requestId: RequestId; deptCode?: string }
+
+    constructor(
+        readonly ws: WebSocket,
+        readonly serviceIndex: string,
+        readonly appUserId: string,
+        private readonly sendMessage: (ws: WebSocket, event: ServerEvent) => void,
+    ) {}
+
+    sendEvent(event: ServerEvent): void {
+        this.sendMessage(this.ws, event)
+    }
+}
+
+export function apply(ctx: Context, config: Config) {
+    const cmisContext: CmisContext = ctx.cmisContext
+    /** sessionId → 会话驱动器 */
+    const drivers = new Map<string, SessionDriver>()
+    /** WebSocket → 终端连接 */
+    const connections = new Map<WebSocket, GatewayConnection>()
+    /** sessionId → 保留期销毁定时器 */
+    const retentionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+    const sendMessage = (ws: WebSocket, event: ServerEvent): void => {
+        if (ws.readyState !== WebSocket.OPEN) return
+        ws.send(JSON.stringify(event))
+    }
+
+    // 会话事件路由：仅处理 gateway 管理的会话且处于活动轮次时
+    ctx.on('session/event', (session, event) => {
+        drivers.get(session.id)?.handleEvent(event)
+    })
+
+    const getOrCreateDriver = async (serviceIndex: string, appUserId: string): Promise<SessionDriver> => {
+        const sessionId = buildSessionId(serviceIndex, appUserId)
+        const existing = drivers.get(sessionId.toString())
+        if (existing) {
+            // 重连复用：取消保留期销毁
+            const timer = retentionTimers.get(sessionId.toString())
+            if (timer) {
+                clearTimeout(timer)
+                retentionTimers.delete(sessionId.toString())
+            }
+            return existing
+        }
+        const handle = await ctx.agents.create({
+            sessionId,
+            meta: { cwd: process.cwd() },
+            agentOptions: ctx.agentDefaultModel.currentSelection(),
+        })
+        const driver = new SessionDriver(sessionId, handle)
+        drivers.set(sessionId.toString(), driver)
+        return driver
+    }
+
+    const scheduleDisposal = (sessionId: string): void => {
+        if (config.sessionRetentionMs <= 0) return
+        const existing = retentionTimers.get(sessionId)
+        if (existing) clearTimeout(existing)
+        const timer = setTimeout(() => {
+            retentionTimers.delete(sessionId)
+            const driver = drivers.get(sessionId)
+            if (!driver) return
+            if (driver.isActive) {
+                // 仍有活动轮次（异常残留），顺延一个保留期再试
+                scheduleDisposal(sessionId)
+                return
+            }
+            drivers.delete(sessionId)
+            void driver.dispose().catch((error) => {
+                ctx.logger.warn(`[cmis-gateway] 销毁会话 "${sessionId}" 失败：${error instanceof Error ? error.message : String(error)}`)
+            })
+        }, config.sessionRetentionMs)
+        retentionTimers.set(sessionId, timer)
+    }
+
+    /** 提交一轮文本对话（deptCode 切换 → 心跳续期 → 失效检查 → 驱动 agent） */
+    const submitTextTurn = async (
+        connection: GatewayConnection,
+        driver: SessionDriver,
+        requestId: RequestId,
+        text: string,
+        deptCode?: string,
+    ): Promise<void> => {
+        const sessionId = driver.sessionId.toString()
+        if (deptCode) {
+            try {
+                await cmisContext.switchShop(sessionId, deptCode)
+            } catch (error) {
+                connection.sendEvent({ requestId, type: 'error', message: error instanceof Error ? error.message : String(error) })
+                return
+            }
+        }
+        // 续期用户心跳（消息到达视为活跃）
+        cmisContext.touchUser(connection.serviceIndex, connection.appUserId, cmisContext.get(sessionId)?.user.userName)
+        // ticket 过期标记：提示终端重新鉴权
+        const sessionContext = cmisContext.get(sessionId)
+        if (sessionContext?.invalid) {
+            connection.sendEvent({ requestId, type: 'error', code: 'unauthorized', message: '登录信息已过期，请重新登录后再试' })
+            return
+        }
+        driver.submit(connection, requestId, text)
+    }
+
+    /** 语音识别控制：start 建识别器、end 结束识别、cancel 取消 */
+    const handleSpeechControl = (connection: GatewayConnection, driver: SessionDriver, control: ClientSpeechControl): void => {
+        const { requestId, stream, speechProperties, deptCode } = control
+        if (stream === 'start') {
+            // 上一次录音未正常收尾：先取消，避免识别器泄漏
+            connection.speechRecognizer?.cancel()
+            connection.speechRecognizer = undefined
+            connection.activeSpeech = undefined
+
+            if (!config.speech) {
+                connection.sendEvent({ requestId, type: 'error', message: '语音识别服务未配置，请联系管理员' })
+                return
+            }
+            if (!speechProperties?.sampleRate) {
+                connection.sendEvent({ requestId, type: 'error', message: '语音开始消息缺少录音参数（speechProperties.sampleRate）' })
+                return
+            }
+
+            connection.activeSpeech = { requestId, deptCode }
+            try {
+                connection.speechRecognizer = new XfyunRealtimeAsr(
+                    config.speech,
+                    speechProperties,
+                    (text, isEnd) => {
+                        // 识别器已被取消/清理（cancel 后的迟到回调），丢弃
+                        if (connection.activeSpeech?.requestId !== requestId) return
+                        if (!isEnd) {
+                            connection.sendEvent({ requestId, type: 'stt', text, isEnd: false })
+                            return
+                        }
+                        // 最终结果：清理识别器并转入对话流程
+                        connection.speechRecognizer = undefined
+                        connection.activeSpeech = undefined
+                        if (!text.trim()) {
+                            connection.sendEvent({ requestId, type: 'error', message: '语音识别未识别到有效内容，请重试' })
+                            return
+                        }
+                        connection.sendEvent({ requestId, type: 'stt', text, isEnd: true })
+                        void submitTextTurn(connection, driver, requestId, text, deptCode)
+                    },
+                    (error) => {
+                        if (connection.activeSpeech?.requestId !== requestId) return
+                        connection.speechRecognizer = undefined
+                        connection.activeSpeech = undefined
+                        connection.sendEvent({ requestId, type: 'error', message: `语音识别服务错误：${error.message}` })
+                    },
+                )
+            } catch (error) {
+                connection.speechRecognizer = undefined
+                connection.activeSpeech = undefined
+                connection.sendEvent({ requestId, type: 'error', message: `语音识别初始化失败：${error instanceof Error ? error.message : String(error)}` })
+            }
+            return
+        }
+        if (stream === 'end') {
+            connection.speechRecognizer?.end()
+            return
+        }
+        if (stream === 'cancel') {
+            connection.speechRecognizer?.cancel()
+            connection.speechRecognizer = undefined
+            connection.activeSpeech = undefined
+        }
+    }
+
+    const handleMessage = async (connection: GatewayConnection, driver: SessionDriver, raw: unknown, isBinary: boolean): Promise<void> => {
+        // 二进制音频帧 → 当前活跃识别器（start 与 end 之间到达）
+        if (isBinary) {
+            if (connection.speechRecognizer) {
+                connection.speechRecognizer.sendAudioData(Buffer.from(raw as ArrayBuffer))
+            }
+            return
+        }
+        let request: ClientRequest | ClientSpeechControl
+        try {
+            request = JSON.parse(String(raw)) as ClientRequest | ClientSpeechControl
+        } catch {
+            connection.sendEvent({ type: 'error', message: '消息格式错误，需要 JSON：{ requestId, text, deptCode? } 或 { type: "speech", requestId, stream, ... }' })
+            return
+        }
+        // 语音识别控制消息
+        if ((request as ClientSpeechControl).type === 'speech') {
+            const control = request as ClientSpeechControl
+            if (!control.requestId || !['start', 'end', 'cancel'].includes(control.stream)) {
+                connection.sendEvent({ requestId: control.requestId, type: 'error', message: '语音消息格式错误：requestId 与 stream（start/end/cancel）为必填' })
+                return
+            }
+            handleSpeechControl(connection, driver, control)
+            return
+        }
+        // 文本对话请求
+        const textRequest = request as ClientRequest
+        if (typeof textRequest?.requestId === 'undefined' || textRequest.requestId === null || typeof textRequest.text !== 'string' || !textRequest.text.trim()) {
+            connection.sendEvent({ requestId: textRequest?.requestId, type: 'error', message: '消息格式错误：requestId 与 text 为必填' })
+            return
+        }
+        await submitTextTurn(connection, driver, textRequest.requestId, textRequest.text, textRequest.deptCode)
+    }
+
+    const server = http.createServer((request, response) => {
+        if (request.url === '/agent/health') {
+            response.writeHead(200, { 'Content-Type': 'application/json' })
+            response.end(JSON.stringify({ status: 'ok', online: connections.size, timestamp: new Date().toISOString() }))
+            return
+        }
+        response.writeHead(404)
+        response.end()
+    })
+    const wss = new WebSocketServer({ server, path: config.path })
+
+    wss.on('connection', (ws, request) => {
+        void (async () => {
+            try {
+                const credentials = readCredentials(request.headers)
+                const authResult = await authenticate(cmisContext, credentials)
+                const driver = await getOrCreateDriver(authResult.serviceIndex, authResult.appUserId)
+                const sessionId = driver.sessionId.toString()
+
+                // 绑定/刷新 cmis-context 会话上下文
+                const existing = cmisContext.get(sessionId)
+                cmisContext.bind(sessionId, {
+                    serviceIndex: authResult.serviceIndex,
+                    serviceUrl: authResult.serviceUrl,
+                    appUserId: authResult.appUserId,
+                    ticket: authResult.ticket,
+                    user: authResult.user,
+                    lastShopCode: existing?.lastShopCode,
+                    lastShopId: existing?.lastShopId,
+                })
+                cmisContext.touchUser(authResult.serviceIndex, authResult.appUserId, authResult.user.userName)
+
+                const connection = new GatewayConnection(ws, authResult.serviceIndex, authResult.appUserId, sendMessage)
+                connections.set(ws, connection)
+
+                // 心跳推送（小程序环境无法访问协议层 pong 帧，走应用层心跳）
+                let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+                if (config.heartbeatIntervalMs > 0) {
+                    heartbeatTimer = setInterval(() => sendMessage(ws, { type: 'heartbeat' }), config.heartbeatIntervalMs)
+                }
+
+                ws.on('message', (message, isBinary) => {
+                    void handleMessage(connection, driver, message, isBinary).catch((error) => {
+                        connection.sendEvent({ type: 'error', message: `消息处理失败，请重试：${error instanceof Error ? error.message : String(error)}` })
+                    })
+                })
+                ws.on('close', () => {
+                    if (heartbeatTimer) clearInterval(heartbeatTimer)
+                    connections.delete(ws)
+                    // 断开时终止进行中的语音识别
+                    connection.speechRecognizer?.cancel()
+                    connection.speechRecognizer = undefined
+                    connection.activeSpeech = undefined
+                    driver.dropPending(connection)
+                    cmisContext.removeUser(connection.serviceIndex, connection.appUserId)
+                    // 无同会话的其他连接时进入保留期，超时无重连则销毁 agent
+                    if (![...connections.values()].some((item) => item.serviceIndex === connection.serviceIndex && item.appUserId === connection.appUserId)) {
+                        scheduleDisposal(driver.sessionId.toString())
+                    }
+                })
+                ws.on('error', () => ws.close())
+
+                sendMessage(ws, { type: 'welcome', text: config.welcomeText })
+            } catch (error) {
+                const message = error instanceof AuthError
+                    ? error.message
+                    : `连接过程中发生错误，请重试：${error instanceof Error ? error.message : String(error)}`
+                sendMessage(ws, { type: 'error', code: error instanceof AuthError ? 'unauthorized' : undefined, message })
+                ws.close()
+            }
+        })()
+    })
+
+    server.listen(config.port, () => {
+        ctx.logger.info(`[cmis-gateway] WebSocket 服务已启动：ws://127.0.0.1:${config.port}${config.path}`)
+    })
+
+    ctx.effect(() => () => {
+        for (const timer of retentionTimers.values()) clearTimeout(timer)
+        retentionTimers.clear()
+        wss.close()
+        server.close()
+    })
+}

@@ -1,0 +1,13 @@
+{
+    "name": "dsh-cmis-agent",
+    "version": "0.1.0",
+    "private": true,
+    "description": "cmis-report-agent 迁移至 DeepSeek Harness 的插件项目（信步报表对话 + 飞书多账号协同）",
+    "keywords": [
+        "cmis",
+        "report",
+        "agent",
+        "dsh-plugin"
+    ],
+    "type": "module"
+}

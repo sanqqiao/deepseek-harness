@@ -1,0 +1,26 @@
+{
+    "compilerOptions": {
+        "target": "ES2023",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "lib": ["ES2023"],
+        "types": ["node"],
+        "strict": true,
+        "noEmit": true,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "allowImportingTsExtensions": true,
+        "verbatimModuleSyntax": true,
+        "forceConsistentCasingInFileNames": true,
+        "paths": {
+            "@deepseek-ai/cordis": ["../vendor/cordis/lib/types/index.d.ts"],
+            "@deepseek-ai/dsh-agent": ["../packages/core/agent/lib/types/index.d.ts"],
+            "@deepseek-ai/dsh-agent-default-model": ["../packages/core/agent-default-model/lib/types/index.d.ts"],
+            "@deepseek-ai/dsh-session": ["../packages/core/session/lib/types/index.d.ts"],
+            "@deepseek-ai/dsh-llm": ["../packages/llm/llm/lib/types/index.d.ts"],
+            "@deepseek-ai/dsh-tools": ["../packages/core/tools/lib/types/index.d.ts"],
+            "@deepseek-ai/schemastery": ["../vendor/schemastery/src/index.ts"]
+        }
+    },
+    "include": ["src/**/*", "test/**/*"]
+}
