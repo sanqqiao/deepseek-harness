@@ -44,7 +44,7 @@ export interface ReportResultData {
     reportCode: string
     reportName: string
     params: Record<string, unknown>
-    columns?: ReportColumnMeta[]
+    columns?: ReportColumnMeta[] | null
     rows: unknown[]
     summary?: Record<string, unknown> | null
     page?: unknown

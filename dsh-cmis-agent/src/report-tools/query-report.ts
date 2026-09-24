@@ -57,7 +57,7 @@ export interface ReportResultData {
     reportCode: string
     reportName: string
     params: Record<string, JsonValue>
-    columns?: ReportColumnDef[]
+    columns?: Record<string, JsonValue>[] | null
     rows: ReportRow[]
     summary?: Record<string, JsonValue> | null
     page: JsonValue
@@ -436,11 +436,11 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                     reportCode: report.reportCode,
                     reportName: report.reportName,
                     params,
-                    columns: report.columns?.map((col) => (
-                        col.format !== undefined
-                            ? { field: col.field, label: col.label, format: col.format }
-                            : { field: col.field, label: col.label }
-                    )),
+                    columns: report.columns?.map((col): Record<string, JsonValue> => {
+                        const out: Record<string, JsonValue> = { field: col.field, label: col.label }
+                        if (col.format !== undefined) out.format = col.format
+                        return out
+                    }) ?? null,
                     rows,
                     summary: summary ?? null,
                     page: respPage
