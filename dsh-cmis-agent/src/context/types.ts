@@ -51,6 +51,8 @@ export interface SessionContext {
     /** 终端应用用户标识（连接头 app-user-id，在线用户表与刷新判断的关联键） */
     appUserId: string
     ticket: string
+    /** 业务系统 Authorization（连接头透传，ticket 过期时供下游静默重登） */
+    authorization?: string
     user: CmisUser
     /** 会话级门店上下文（deptCode 切换时更新） */
     lastShopCode?: string

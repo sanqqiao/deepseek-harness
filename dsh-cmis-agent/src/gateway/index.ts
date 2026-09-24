@@ -12,7 +12,7 @@ import type { ClientRequest, ClientSpeechControl, RequestId, ServerEvent } from 
 import type { CmisContext } from '../context/index.ts'
 
 export const name = 'cmis-gateway'
-export const inject = ['cmisContext', 'agents', 'agentDefaultModel']
+export const inject = ['cmisContext', 'agents', 'agentDefaultModel', 'sessionPersistence']
 
 export const defaultWelcomeText = `欢迎使用信步AI报表助手！我是您的智能报表查询助手。
 
@@ -97,6 +97,18 @@ export function apply(ctx: Context, config: Config) {
             }
             return existing
         }
+        // 磁盘已有同 id 会话（进程重启后重连）：resume 恢复历史，避免 id collision
+        const persistence = ctx.get('sessionPersistence')
+        const persisted = persistence !== undefined && (await persistence.list()).some((header: { id: string }) => header.id === sessionId)
+        if (persisted) {
+            const resumed = await ctx.agents.resume({
+                resumeSessionId: sessionId,
+                agentOptions: ctx.agentDefaultModel.currentSelection(),
+            })
+            const driver = new SessionDriver(sessionId, resumed)
+            drivers.set(sessionId.toString(), driver)
+            return driver
+        }
         const handle = await ctx.agents.create({
             sessionId,
             meta: { cwd: process.cwd() },
@@ -147,6 +159,15 @@ export function apply(ctx: Context, config: Config) {
         }
         // 续期用户心跳（消息到达视为活跃）
         cmisContext.touchUser(connection.serviceIndex, connection.appUserId, cmisContext.get(sessionId)?.user.userName)
+        // 空闲超过刷新间隔：先续期用户信息（携带 Authorization，ticket 过期时下游静默重登换新票）
+        if (cmisContext.needsRefresh(sessionId)) {
+            try {
+                await cmisContext.refreshUser(sessionId)
+            } catch (error) {
+                // flag=20 时 refreshUser 已标记 invalid，走下方统一拦截
+                ctx.logger.warn(`[cmis-gateway] 会话 "${sessionId}" 用户信息刷新失败：${error instanceof Error ? error.message : String(error)}`)
+            }
+        }
         // ticket 过期标记：提示终端重新鉴权
         const sessionContext = cmisContext.get(sessionId)
         if (sessionContext?.invalid) {
@@ -281,6 +302,7 @@ export function apply(ctx: Context, config: Config) {
                     serviceUrl: authResult.serviceUrl,
                     appUserId: authResult.appUserId,
                     ticket: authResult.ticket,
+                    authorization: authResult.authorization,
                     user: authResult.user,
                     lastShopCode: existing?.lastShopCode,
                     lastShopId: existing?.lastShopId,

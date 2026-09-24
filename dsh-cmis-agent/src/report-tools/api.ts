@@ -26,6 +26,7 @@ async function postJson<T = unknown>(
         'Content-Type': 'application/json',
         'Simple-Ticket': sessionContext.ticket,
     }
+    if (sessionContext.authorization) headers['Authorization'] = sessionContext.authorization
     if (page) headers['Simple-Page'] = JSON.stringify(page)
     const response = await fetch(buildUrl(sessionContext.serviceUrl, path), {
         method: 'POST',

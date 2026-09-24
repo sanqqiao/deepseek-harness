@@ -17,6 +17,7 @@ export interface AuthResult {
     serviceUrl: string
     appUserId: string
     ticket: string
+    authorization?: string
     user: CmisUser
 }
 
@@ -89,6 +90,7 @@ export async function authenticate(cmisContext: CmisContext, credentials: AuthCr
         serviceUrl,
         appUserId: credentials.appUserId,
         ticket: result.data.ticket ?? credentials.ticket,
+        authorization: credentials.authorization,
         user: result.data,
     }
 }

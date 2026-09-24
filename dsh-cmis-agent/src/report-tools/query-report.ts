@@ -15,7 +15,7 @@ import type { SessionContext, SimpleReturn } from '../context/types.ts'
 import { agentCacheList, agentCacheQuery, queryReport } from './api.ts'
 import type { PageParam } from './api.ts'
 import { findReport } from './registry.ts'
-import type { ReportDefinition } from './registry.ts'
+import type { ReportDefinition, ReportColumnDef } from './registry.ts'
 import { markUnlogin, resolveToolSession, UNLOGIN_MESSAGE } from './session.ts'
 
 /** 单次回传 LLM 的最大行数（防止超长 tool 结果撑爆上下文） */
@@ -57,7 +57,9 @@ export interface ReportResultData {
     reportCode: string
     reportName: string
     params: Record<string, JsonValue>
+    columns?: ReportColumnDef[]
     rows: ReportRow[]
+    summary?: Record<string, JsonValue> | null
     page: JsonValue
     dataSource: 'cache' | 'realtime'
     cacheUpdatedAt: string | null
@@ -141,7 +143,7 @@ async function queryFromCache(
     page: number,
     pageSize: number,
     signal?: AbortSignal,
-): Promise<{ rows: ReportRow[]; page?: PageInfoLike; updatedAt: string; period: string } | null> {
+): Promise<{ rows: ReportRow[]; summary?: Record<string, JsonValue> | null; page?: PageInfoLike; updatedAt: string; period: string } | null> {
     const cacheConfig = report.cache!
     try {
         const listResp = await agentCacheList(
@@ -189,35 +191,67 @@ async function queryFromCache(
 
         const data = (queryResp.data as { data?: unknown }).data
         const rows: ReportRow[] = Array.isArray(data) ? data as ReportRow[] : data ? [data as ReportRow] : []
+        const summary = (queryResp.data as { summary?: unknown }).summary
         const updatedAt = doc.updatedAt instanceof Date
             ? doc.updatedAt.toISOString()
             : String(doc.updatedAt)
-        return { rows, page: queryResp.page as PageInfoLike | undefined, updatedAt, period: doc.period }
+        return {
+            rows,
+            summary: summary && typeof summary === 'object' && !Array.isArray(summary)
+                ? summary as Record<string, JsonValue>
+                : null,
+            page: queryResp.page as PageInfoLike | undefined,
+            updatedAt,
+            period: doc.period,
+        }
     } catch {
         return null
     }
 }
 
-/** 把报表行转成 markdown 表格（列名取第一行的键） */
-export function buildMarkdownTable(reportName: string, rows: ReportRow[]): string {
+/** 从列定义解析 markdown/汇总用列清单（无定义时取数据第一行键兜底） */
+export function resolveColumns(
+    columns: ReportColumnDef[] | undefined,
+    rows: ReportRow[],
+): ReportColumnDef[] {
+    if (columns && columns.length > 0) {
+        return columns.filter(
+            (col) => rows.length === 0 || rows.some((row) => row[col.field] !== undefined),
+        )
+    }
+    if (rows.length === 0) return []
+    return Object.keys(rows[0])
+        .filter((key) => typeof rows[0][key] !== 'object' || rows[0][key] === null)
+        .map((field) => ({ field, label: field }))
+}
+
+/** 单元格文本（markdown 转义） */
+function cellText(value: JsonValue | undefined): string {
+    return value === null || value === undefined ? '' : String(value).replace(/\|/g, '\\|')
+}
+
+/** 把报表行转成 markdown 表格（中文表头，可选汇总行） */
+export function buildMarkdownTable(
+    reportName: string,
+    rows: ReportRow[],
+    columns?: ReportColumnDef[],
+    summary?: Record<string, JsonValue> | null,
+): string {
     if (rows.length === 0) {
         return `${reportName}：查询结果为空`
     }
-    const keys = Object.keys(rows[0]).filter(
-        (key) => typeof rows[0][key] !== 'object' || rows[0][key] === null,
-    )
-    const header = `| ${keys.join(' | ')} |`
-    const separator = `| ${keys.map(() => '---').join(' | ')} |`
+    const cols = resolveColumns(columns, rows)
+    const header = `| ${cols.map((col) => col.label).join(' | ')} |`
+    const separator = `| ${cols.map(() => '---').join(' | ')} |`
     const body = rows
-        .map((row) => {
-            const cells = keys.map((key) => {
-                const value = row[key]
-                return value === null || value === undefined ? '' : String(value).replace(/\|/g, '\\|')
-            })
-            return `| ${cells.join(' | ')} |`
-        })
+        .map((row) => `| ${cols.map((col) => cellText(row[col.field])).join(' | ')} |`)
         .join('\n')
-    return `${header}\n${separator}\n${body}`
+    const summaryLine = summary
+        ? `\n| ${cols
+            .map((col, index) => (index === 0 ? '合计' : cellText(summary[col.field] as JsonValue | undefined)))
+            .join(' | ')} |`
+        : ''
+    return `${header}\n${separator}\n${body}${summaryLine}`
 }
 
 /** 组装查询参数：只传报表注册表中定义的参数（必填缺省用默认值兜底） */
@@ -317,6 +351,7 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
             let cachePeriod: string | undefined
             let rows: ReportRow[] = []
             let respPage: PageInfoLike | undefined
+            let summary: Record<string, JsonValue> | null | undefined
 
             if (report.cache) {
                 const cacheResult = await queryFromCache(
@@ -335,6 +370,7 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                     cachePeriod = cacheResult.period
                     rows = cacheResult.rows
                     respPage = cacheResult.page
+                    summary = cacheResult.summary
                 }
             }
 
@@ -368,11 +404,14 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                 const data = resp.data
                 rows = Array.isArray(data) ? data as ReportRow[] : data ? [data as ReportRow] : []
                 respPage = resp.page as PageInfoLike | undefined
+                summary = resp.sum && typeof resp.sum === 'object' && !Array.isArray(resp.sum)
+                    ? resp.sum as Record<string, JsonValue>
+                    : null
             }
 
             // markdown 表格给 LLM 组织回复（截断防止超长）
             const previewRows = rows.slice(0, MAX_ROWS_TO_LLM)
-            const markdown = buildMarkdownTable(report.reportName, previewRows)
+            const markdown = buildMarkdownTable(report.reportName, previewRows, report.columns, summary)
             const pageDesc = respPage
                 ? `共 ${respPage.totalRows ?? rows.length} 行，当前第 ${respPage.currentPage}/${respPage.totalPages ?? 1} 页`
                 : `共 ${rows.length} 行`
@@ -397,7 +436,13 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                     reportCode: report.reportCode,
                     reportName: report.reportName,
                     params,
+                    columns: report.columns?.map((col) => (
+                        col.format !== undefined
+                            ? { field: col.field, label: col.label, format: col.format }
+                            : { field: col.field, label: col.label }
+                    )),
                     rows,
+                    summary: summary ?? null,
                     page: respPage
                         ? {
                             totalRows: respPage.totalRows ?? null,

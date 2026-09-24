@@ -32,12 +32,21 @@ export interface UsageSummary {
     outputTokens: number
 }
 
+/** 报表列定义（中文名与数值格式，前端表头/格式化用） */
+export interface ReportColumnMeta {
+    field: string
+    label: string
+    format?: 'money' | 'qty' | 'days' | 'ratio' | 'text'
+}
+
 /** 报表工具结构化结果（query_report 的 presentationMeta 投影，前端渲染完整表格用） */
 export interface ReportResultData {
     reportCode: string
     reportName: string
     params: Record<string, unknown>
+    columns?: ReportColumnMeta[]
     rows: unknown[]
+    summary?: Record<string, unknown> | null
     page?: unknown
     dataSource: 'cache' | 'realtime'
     cacheUpdatedAt?: string

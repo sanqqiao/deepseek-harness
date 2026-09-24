@@ -41,7 +41,7 @@ function buildUrl(baseUrl: string, path: string): string {
     return (baseUrl + path).replace(/([^:]\/)\/+/g, '$1')
 }
 
-async function postJson(url: string, body: unknown, headers: Record<string, string>, signal?: AbortSignal): Promise<SimpleReturn> {
+async function postJson(url: string, body: unknown, headers: Record<string, string>, signal?: AbortSignal): Promise<{ result: SimpleReturn; responseTicket?: string }> {
     const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...headers },
@@ -51,7 +51,10 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
     if (!response.ok) {
         throw new Error(`请求失败（HTTP ${response.status}）：${url}`)
     }
-    return await response.json() as SimpleReturn
+    return {
+        result: await response.json() as SimpleReturn,
+        responseTicket: response.headers.get('simple-ticket') ?? undefined,
+    }
 }
 
 /**
@@ -105,7 +108,7 @@ export class CmisContext extends Service {
     async resolveServiceUrl(serviceIndex: string, signal?: AbortSignal): Promise<string> {
         const cached = this.serviceUrlCache.get(serviceIndex)
         if (cached) return cached
-        const result = await postJson(
+        const { result } = await postJson(
             buildUrl(this.config.centerServer, '/app/service/getAppService.do'),
             { serviceIndex },
             { Authorization: this.config.centerAuthorization },
@@ -134,10 +137,10 @@ export class CmisContext extends Service {
      */
     async refreshUser(sessionId: string, signal?: AbortSignal): Promise<CmisUser> {
         const context = this.requireContext(sessionId)
-        const result = await postJson(
+        const { result, responseTicket } = await postJson(
             buildUrl(context.serviceUrl, '/system/onlineUser/getUserByTicket.do'),
             { ticket: context.ticket },
-            { 'Simple-Ticket': context.ticket },
+            this.buildAuthHeaders(context),
             signal,
         )
         if (result.flag === ResponseFlag.UNLOGIN) {
@@ -149,7 +152,8 @@ export class CmisContext extends Service {
         }
         const user = result.data as CmisUser
         context.user = user
-        if (user.ticket) context.ticket = user.ticket
+        if (responseTicket) context.ticket = responseTicket
+        else if (user.ticket) context.ticket = user.ticket
         return user
     }
 
@@ -158,12 +162,13 @@ export class CmisContext extends Service {
      */
     async switchShop(sessionId: string, deptCode: string, signal?: AbortSignal): Promise<{ lastShopCode: string; lastShopId: number }> {
         const context = this.requireContext(sessionId)
-        const result = await postJson(
+        const { result, responseTicket } = await postJson(
             buildUrl(context.serviceUrl, '/system/dept/getByCode.do'),
             { deptCode },
-            { 'Simple-Ticket': context.ticket },
+            this.buildAuthHeaders(context),
             signal,
         )
+        if (responseTicket) context.ticket = responseTicket
         if (result.flag !== ResponseFlag.SUCCESS) {
             throw new Error(result.message || `根据编码 ${deptCode} 查找门店失败`)
         }
@@ -204,6 +209,13 @@ export class CmisContext extends Service {
         const record = this.onlineUsers.get(`${context.serviceIndex}|${context.appUserId}`)
         if (!record) return true
         return Date.now() - record.lastActiveAt >= this.config.userRefreshIntervalMs
+    }
+
+    /** 统一鉴权请求头：Simple-Ticket + 可选 Authorization（ticket 过期时下游静默重登） */
+    private buildAuthHeaders(context: SessionContext): Record<string, string> {
+        const headers: Record<string, string> = { 'Simple-Ticket': context.ticket }
+        if (context.authorization) headers['Authorization'] = context.authorization
+        return headers
     }
 
     private requireContext(sessionId: string): SessionContext {
