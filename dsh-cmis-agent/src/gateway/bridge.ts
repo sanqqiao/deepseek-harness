@@ -4,9 +4,9 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { RequestId, ReportResultData, ServerEvent, UsageSummary } from './types.ts'
 
-/** 会话键：DSH 会话按 serviceIndex-appUserId 复用（断线重连上下文不丢） */
-export function buildSessionId(serviceIndex: string, appUserId: string): SessionId {
-    return SessionId(`cmis-${serviceIndex}-${appUserId}`)
+/** 会话键：DSH 会话按 serviceIndex-businessType-appUserId 复用（断线重连上下文不丢，业务间互相隔离） */
+export function buildSessionId(serviceIndex: string, businessType: string, appUserId: string): SessionId {
+    return SessionId(`cmis-${serviceIndex}-${businessType}-${appUserId}`)
 }
 
 /**

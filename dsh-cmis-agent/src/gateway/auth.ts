@@ -1,7 +1,7 @@
 import type { CmisContext } from '../context/index.ts'
 import { ResponseFlag } from '../context/types.ts'
 import type { CmisUser, SimpleReturn } from '../context/types.ts'
-import { HEADER_NAMES } from './types.ts'
+import { HEADER_NAMES, DEFAULT_BUSINESS_TYPE } from './types.ts'
 
 /** 连接鉴权凭证（来自 WS 升级请求头） */
 export interface AuthCredentials {
@@ -9,6 +9,7 @@ export interface AuthCredentials {
     ticket: string
     appUserId: string
     authorization?: string
+    businessType: string
 }
 
 /** 连接鉴权结果 */
@@ -18,6 +19,7 @@ export interface AuthResult {
     appUserId: string
     ticket: string
     authorization?: string
+    businessType: string
     user: CmisUser
 }
 
@@ -41,6 +43,7 @@ export function readCredentials(headers: Record<string, string | string[] | unde
         ticket: getHeader(HEADER_NAMES.ticket) ?? '',
         appUserId: getHeader(HEADER_NAMES.appUserId) ?? '',
         authorization: getHeader(HEADER_NAMES.authorization),
+        businessType: getHeader(HEADER_NAMES.businessType)?.trim() || DEFAULT_BUSINESS_TYPE,
     }
 }
 
@@ -91,6 +94,7 @@ export async function authenticate(cmisContext: CmisContext, credentials: AuthCr
         appUserId: credentials.appUserId,
         ticket: result.data.ticket ?? credentials.ticket,
         authorization: credentials.authorization,
+        businessType: credentials.businessType,
         user: result.data,
     }
 }

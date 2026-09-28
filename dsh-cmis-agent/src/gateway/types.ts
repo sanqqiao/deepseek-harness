@@ -5,8 +5,10 @@ export type RequestId = number | string
 export interface ClientRequest {
     requestId: RequestId
     text: string
-    /** 门店切换（可选，沿用旧语义：切换后会话级门店上下文更新） */
+    /** 门店切换（可选，切换后会话级门店上下文更新） */
     deptCode?: string
+    /** 业务类型（可选，缺省沿用连接当前业务；变化时切换到对应业务的会话） */
+    businessType?: string
 }
 
 /** 终端 → 服务端消息：语音识别控制（二进制音频帧裸发于 start/end 之间） */
@@ -24,6 +26,8 @@ export interface ClientSpeechControl {
     }
     /** 门店切换（可选，识别完成文本转入对话流程时使用） */
     deptCode?: string
+    /** 业务类型（可选，识别完成文本转入对话流程时使用；缺省沿用连接当前业务） */
+    businessType?: string
 }
 
 /** 一轮对话的 token 用量摘要 */
@@ -68,4 +72,8 @@ export const HEADER_NAMES = {
     ticket: 'simple-ticket',
     appUserId: 'app-user-id',
     authorization: 'authorization',
+    businessType: 'business-type',
 } as const
+
+/** 缺省业务类型（客户端未携带 business-type 头时使用，保持旧行为） */
+export const DEFAULT_BUSINESS_TYPE = 'default'

@@ -79,7 +79,7 @@ test('readCredentials：缺失头返回空串', () => {
 
 test('authenticate：缺凭证抛 AuthError', async () => {
     const cmisContext = await createCmisContext()
-    await assert.rejects(authenticate(cmisContext, { serviceIndex: '', ticket: '', appUserId: '' }), AuthError)
+    await assert.rejects(authenticate(cmisContext, { serviceIndex: '', ticket: '', appUserId: '', businessType: 'default' }), AuthError)
 })
 
 test('authenticate：成功返回用户并续期 ticket', async () => {
@@ -92,10 +92,12 @@ test('authenticate：成功返回用户并续期 ticket', async () => {
             serviceIndex: 'mall-001',
             ticket: 'ticket-old',
             appUserId: 'app-user-1',
+            businessType: 'report',
         })
         assert.equal(result.serviceUrl, 'https://mall-1.test')
         assert.equal(result.serviceIndex, 'mall-001')
         assert.equal(result.appUserId, 'app-user-1')
+        assert.equal(result.businessType, 'report')
         assert.equal(result.ticket, 'ticket-new')
         assert.equal(result.user.userId, 1)
         // getUserByTicket 请求：Simple-Ticket 头 + body.ticket
@@ -116,7 +118,7 @@ test('authenticate：flag=20 拒绝连接并提示重新登录', async () => {
     try {
         const cmisContext = await createCmisContext()
         await assert.rejects(
-            authenticate(cmisContext, { serviceIndex: 'mall-001', ticket: 'bad', appUserId: 'app-user-1' }),
+            authenticate(cmisContext, { serviceIndex: 'mall-001', ticket: 'bad', appUserId: 'app-user-1', businessType: 'report' }),
             /重新登录/,
         )
     } finally {
@@ -126,8 +128,9 @@ test('authenticate：flag=20 拒绝连接并提示重新登录', async () => {
 
 // ---- buildSessionId ----
 
-test('buildSessionId：serviceIndex-appUserId 组合', () => {
-    assert.equal(buildSessionId('mall-001', 'app-user-1').toString(), 'cmis-mall-001-app-user-1')
+test('buildSessionId：serviceIndex-businessType-appUserId 组合', () => {
+    assert.equal(buildSessionId('mall-001', 'report', 'app-user-1').toString(), 'cmis-mall-001-report-app-user-1')
+    assert.equal(buildSessionId('mall-001', 'default', 'app-user-1').toString(), 'cmis-mall-001-default-app-user-1')
 })
 
 // ---- TurnTranslator ----
@@ -217,7 +220,7 @@ function createDriver(): { driver: SessionDriver; followups: string[]; disposed:
         },
         dispose: async () => { },
     } as unknown as AgentHandle
-    return { driver: new SessionDriver(buildSessionId('mall-001', 'app-user-1'), handle), followups, disposed: false }
+    return { driver: new SessionDriver(buildSessionId('mall-001', 'default', 'app-user-1'), handle), followups, disposed: false }
 }
 
 test('SessionDriver：空闲提交立即驱动，事件回推发起连接', () => {
@@ -274,7 +277,7 @@ test('SessionDriver：followup 抛错时回推 error 且不卡死驱动器', () 
         agent: { followup: () => { throw new Error('agent 已销毁') } },
         dispose: async () => { },
     } as unknown as AgentHandle
-    const driver = new SessionDriver(buildSessionId('mall-001', 'app-user-1'), handle)
+    const driver = new SessionDriver(buildSessionId('mall-001', 'default', 'app-user-1'), handle)
     const connection = createConnection()
     driver.submit(connection, 1, '你好')
 

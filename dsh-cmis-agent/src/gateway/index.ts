@@ -9,6 +9,7 @@ import type { TurnConnection } from './bridge.ts'
 import { XfyunRealtimeAsr } from './speech.ts'
 import type { SpeechRecognition, XfyunCredential } from './speech.ts'
 import type { ClientRequest, ClientSpeechControl, RequestId, ServerEvent } from './types.ts'
+import { DEFAULT_BUSINESS_TYPE } from './types.ts'
 import type { CmisContext } from '../context/index.ts'
 
 export const name = 'cmis-gateway'
@@ -52,14 +53,22 @@ class GatewayConnection implements TurnConnection {
     /** 活跃语音识别器（连接级，一次一个录音会话） */
     speechRecognizer?: SpeechRecognition
     /** 当前语音会话（识别完成后按此提交对话） */
-    activeSpeech?: { requestId: RequestId; deptCode?: string }
+    activeSpeech?: { requestId: RequestId; deptCode?: string; driver: SessionDriver }
+    /** 连接级当前业务（消息未携带 businessType 时沿用；消息携带时随消息更新） */
+    businessType: string
+    /** 本连接使用过的全部业务（断开时逐一释放对应会话） */
+    readonly usedBusinessTypes = new Set<string>()
 
     constructor(
         readonly ws: WebSocket,
         readonly serviceIndex: string,
         readonly appUserId: string,
+        businessType: string,
         private readonly sendMessage: (ws: WebSocket, event: ServerEvent) => void,
-    ) {}
+    ) {
+        this.businessType = businessType
+        this.usedBusinessTypes.add(businessType)
+    }
 
     sendEvent(event: ServerEvent): void {
         this.sendMessage(this.ws, event)
@@ -85,8 +94,8 @@ export function apply(ctx: Context, config: Config) {
         drivers.get(session.id)?.handleEvent(event)
     })
 
-    const getOrCreateDriver = async (serviceIndex: string, appUserId: string): Promise<SessionDriver> => {
-        const sessionId = buildSessionId(serviceIndex, appUserId)
+    const getOrCreateDriver = async (serviceIndex: string, businessType: string, appUserId: string): Promise<SessionDriver> => {
+        const sessionId = buildSessionId(serviceIndex, businessType, appUserId)
         const existing = drivers.get(sessionId.toString())
         if (existing) {
             // 重连复用：取消保留期销毁
@@ -140,7 +149,7 @@ export function apply(ctx: Context, config: Config) {
         retentionTimers.set(sessionId, timer)
     }
 
-    /** 提交一轮文本对话（deptCode 切换 → 心跳续期 → 失效检查 → 驱动 agent） */
+    /** 提交一轮文本对话（businessType 切换 → deptCode 切换 → 心跳续期 → 失效检查 → 驱动 agent） */
     const submitTextTurn = async (
         connection: GatewayConnection,
         driver: SessionDriver,
@@ -178,8 +187,8 @@ export function apply(ctx: Context, config: Config) {
     }
 
     /** 语音识别控制：start 建识别器、end 结束识别、cancel 取消 */
-    const handleSpeechControl = (connection: GatewayConnection, driver: SessionDriver, control: ClientSpeechControl): void => {
-        const { requestId, stream, speechProperties, deptCode } = control
+    const handleSpeechControl = (connection: GatewayConnection, control: ClientSpeechControl): void => {
+        const { requestId, stream, speechProperties, deptCode, businessType } = control
         if (stream === 'start') {
             // 上一次录音未正常收尾：先取消，避免识别器泄漏
             connection.speechRecognizer?.cancel()
@@ -195,40 +204,44 @@ export function apply(ctx: Context, config: Config) {
                 return
             }
 
-            connection.activeSpeech = { requestId, deptCode }
-            try {
-                connection.speechRecognizer = new XfyunRealtimeAsr(
-                    config.speech,
-                    speechProperties,
-                    (text, isEnd) => {
-                        // 识别器已被取消/清理（cancel 后的迟到回调），丢弃
-                        if (connection.activeSpeech?.requestId !== requestId) return
-                        if (!isEnd) {
-                            connection.sendEvent({ requestId, type: 'stt', text, isEnd: false })
-                            return
-                        }
-                        // 最终结果：清理识别器并转入对话流程
-                        connection.speechRecognizer = undefined
-                        connection.activeSpeech = undefined
-                        if (!text.trim()) {
-                            connection.sendEvent({ requestId, type: 'error', message: '语音识别未识别到有效内容，请重试' })
-                            return
-                        }
-                        connection.sendEvent({ requestId, type: 'stt', text, isEnd: true })
-                        void submitTextTurn(connection, driver, requestId, text, deptCode)
-                    },
-                    (error) => {
-                        if (connection.activeSpeech?.requestId !== requestId) return
-                        connection.speechRecognizer = undefined
-                        connection.activeSpeech = undefined
-                        connection.sendEvent({ requestId, type: 'error', message: `语音识别服务错误：${error.message}` })
-                    },
-                )
-            } catch (error) {
-                connection.speechRecognizer = undefined
-                connection.activeSpeech = undefined
-                connection.sendEvent({ requestId, type: 'error', message: `语音识别初始化失败：${error instanceof Error ? error.message : String(error)}` })
-            }
+            // 业务在 start 时确定（缺省沿用连接当前业务），识别完成文本提交到该业务会话
+            const speechConfig = config.speech
+            void resolveDriver(connection, businessType ?? connection.businessType).then((driver) => {
+                connection.activeSpeech = { requestId, deptCode, driver }
+                try {
+                    connection.speechRecognizer = new XfyunRealtimeAsr(
+                        speechConfig,
+                        speechProperties,
+                        (text, isEnd) => {
+                            // 识别器已被取消/清理（cancel 后的迟到回调），丢弃
+                            if (connection.activeSpeech?.requestId !== requestId) return
+                            if (!isEnd) {
+                                connection.sendEvent({ requestId, type: 'stt', text, isEnd: false })
+                                return
+                            }
+                            // 最终结果：清理识别器并转入对话流程
+                            connection.speechRecognizer = undefined
+                            connection.activeSpeech = undefined
+                            if (!text.trim()) {
+                                connection.sendEvent({ requestId, type: 'error', message: '语音识别未识别到有效内容，请重试' })
+                                return
+                            }
+                            connection.sendEvent({ requestId, type: 'stt', text, isEnd: true })
+                            void submitTextTurn(connection, driver, requestId, text, deptCode)
+                        },
+                        (error) => {
+                            if (connection.activeSpeech?.requestId !== requestId) return
+                            connection.speechRecognizer = undefined
+                            connection.activeSpeech = undefined
+                            connection.sendEvent({ requestId, type: 'error', message: `语音识别服务错误：${error.message}` })
+                        },
+                    )
+                } catch (error) {
+                    connection.speechRecognizer = undefined
+                    connection.activeSpeech = undefined
+                    connection.sendEvent({ requestId, type: 'error', message: `语音识别初始化失败：${error instanceof Error ? error.message : String(error)}` })
+                }
+            })
             return
         }
         if (stream === 'end') {
@@ -242,7 +255,38 @@ export function apply(ctx: Context, config: Config) {
         }
     }
 
-    const handleMessage = async (connection: GatewayConnection, driver: SessionDriver, raw: unknown, isBinary: boolean): Promise<void> => {
+    /** 按业务解析目标会话驱动器（业务变化时更新连接当前业务并切换，旧业务会话无其他连接使用则进入保留期） */
+    const resolveDriver = async (connection: GatewayConnection, businessType?: string): Promise<SessionDriver> => {
+        const target = businessType?.trim() || connection.businessType || DEFAULT_BUSINESS_TYPE
+        const previous = connection.businessType
+        connection.usedBusinessTypes.add(target)
+        if (target !== previous) connection.businessType = target
+        const driver = await getOrCreateDriver(connection.serviceIndex, target, connection.appUserId)
+        // 切换业务：旧业务会话无同会话其他连接时进入保留期，超时无使用则销毁
+        if (target !== previous) {
+            releaseDriver(previous, connection)
+        }
+        return driver
+    }
+
+    /** 收集连接涉及的全部业务（本连接使用过的业务集合，断开时逐一释放对应会话与排队请求） */
+    const collectConnectionBusinessTypes = (connection: GatewayConnection): string[] => {
+        return [...connection.usedBusinessTypes]
+    }
+
+    /** 释放连接对某业务会话的占用（断开或业务切换时调用；无同会话其他连接时进入保留期） */
+    const releaseDriver = (businessType: string, connection: GatewayConnection): void => {
+        const sessionId = buildSessionId(connection.serviceIndex, businessType, connection.appUserId).toString()
+        const inUse = [...connections.values()].some((item) =>
+            item !== connection
+            && item.serviceIndex === connection.serviceIndex
+            && item.appUserId === connection.appUserId
+            && item.businessType === businessType,
+        )
+        if (!inUse) scheduleDisposal(sessionId)
+    }
+
+    const handleMessage = async (connection: GatewayConnection, raw: unknown, isBinary: boolean): Promise<void> => {
         // 二进制音频帧 → 当前活跃识别器（start 与 end 之间到达）
         if (isBinary) {
             if (connection.speechRecognizer) {
@@ -254,17 +298,17 @@ export function apply(ctx: Context, config: Config) {
         try {
             request = JSON.parse(String(raw)) as ClientRequest | ClientSpeechControl
         } catch {
-            connection.sendEvent({ type: 'error', message: '消息格式错误，需要 JSON：{ requestId, text, deptCode? } 或 { type: "speech", requestId, stream, ... }' })
+            connection.sendEvent({ type: 'error', message: '消息格式错误，需要 JSON：{ requestId, text, deptCode?, businessType? } 或 { type: "speech", requestId, stream, ... }' })
             return
         }
-        // 语音识别控制消息
+        // 语音识别控制消息（业务在 start 时解析，end/cancel 只操作识别器）
         if ((request as ClientSpeechControl).type === 'speech') {
             const control = request as ClientSpeechControl
             if (!control.requestId || !['start', 'end', 'cancel'].includes(control.stream)) {
                 connection.sendEvent({ requestId: control.requestId, type: 'error', message: '语音消息格式错误：requestId 与 stream（start/end/cancel）为必填' })
                 return
             }
-            handleSpeechControl(connection, driver, control)
+            handleSpeechControl(connection, control)
             return
         }
         // 文本对话请求
@@ -273,7 +317,12 @@ export function apply(ctx: Context, config: Config) {
             connection.sendEvent({ requestId: textRequest?.requestId, type: 'error', message: '消息格式错误：requestId 与 text 为必填' })
             return
         }
-        await submitTextTurn(connection, driver, textRequest.requestId, textRequest.text, textRequest.deptCode)
+        try {
+            const driver = await resolveDriver(connection, textRequest.businessType)
+            await submitTextTurn(connection, driver, textRequest.requestId, textRequest.text, textRequest.deptCode)
+        } catch (error) {
+            connection.sendEvent({ requestId: textRequest.requestId, type: 'error', message: `会话创建失败，请重试：${error instanceof Error ? error.message : String(error)}` })
+        }
     }
 
     const server = http.createServer((request, response) => {
@@ -292,7 +341,7 @@ export function apply(ctx: Context, config: Config) {
             try {
                 const credentials = readCredentials(request.headers)
                 const authResult = await authenticate(cmisContext, credentials)
-                const driver = await getOrCreateDriver(authResult.serviceIndex, authResult.appUserId)
+                const driver = await getOrCreateDriver(authResult.serviceIndex, authResult.businessType, authResult.appUserId)
                 const sessionId = driver.sessionId.toString()
 
                 // 绑定/刷新 cmis-context 会话上下文
@@ -309,7 +358,7 @@ export function apply(ctx: Context, config: Config) {
                 })
                 cmisContext.touchUser(authResult.serviceIndex, authResult.appUserId, authResult.user.userName)
 
-                const connection = new GatewayConnection(ws, authResult.serviceIndex, authResult.appUserId, sendMessage)
+                const connection = new GatewayConnection(ws, authResult.serviceIndex, authResult.appUserId, authResult.businessType, sendMessage)
                 connections.set(ws, connection)
 
                 // 心跳推送（小程序环境无法访问协议层 pong 帧，走应用层心跳）
@@ -319,7 +368,7 @@ export function apply(ctx: Context, config: Config) {
                 }
 
                 ws.on('message', (message, isBinary) => {
-                    void handleMessage(connection, driver, message, isBinary).catch((error) => {
+                    void handleMessage(connection, message, isBinary).catch((error) => {
                         connection.sendEvent({ type: 'error', message: `消息处理失败，请重试：${error instanceof Error ? error.message : String(error)}` })
                     })
                 })
@@ -330,12 +379,13 @@ export function apply(ctx: Context, config: Config) {
                     connection.speechRecognizer?.cancel()
                     connection.speechRecognizer = undefined
                     connection.activeSpeech = undefined
-                    driver.dropPending(connection)
-                    cmisContext.removeUser(connection.serviceIndex, connection.appUserId)
-                    // 无同会话的其他连接时进入保留期，超时无重连则销毁 agent
-                    if (![...connections.values()].some((item) => item.serviceIndex === connection.serviceIndex && item.appUserId === connection.appUserId)) {
-                        scheduleDisposal(driver.sessionId.toString())
+                    // 各业务会话逐一释放：丢弃排队请求，无同会话的其他连接时进入保留期，超时无重连则销毁 agent
+                    for (const businessType of collectConnectionBusinessTypes(connection)) {
+                        const sessionId = buildSessionId(connection.serviceIndex, businessType, connection.appUserId).toString()
+                        drivers.get(sessionId)?.dropPending(connection)
+                        releaseDriver(businessType, connection)
                     }
+                    cmisContext.removeUser(connection.serviceIndex, connection.appUserId)
                 })
                 ws.on('error', () => ws.close())
 
