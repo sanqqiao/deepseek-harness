@@ -4,6 +4,11 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { RequestId, ReportResultData, ServerEvent, UsageSummary } from './types.ts'
 
+/** 运行期日志：直接写 stdout，确保在 dsh-server.log 中可见（ctx.logger 在网关运行期不落盘） */
+const log = (message: string): void => {
+    process.stdout.write(`[cmis-gateway] ${new Date().toISOString()} ${message}\n`)
+}
+
 /** 会话键：DSH 会话按 serviceIndex-businessType-appUserId 复用（断线重连上下文不丢，业务间互相隔离） */
 export function buildSessionId(serviceIndex: string, businessType: string, appUserId: string): SessionId {
     return SessionId(`cmis-${serviceIndex}-${businessType}-${appUserId}`)
@@ -83,11 +88,10 @@ export class TurnTranslator {
     }
 }
 
-/** 提交待处理的一轮对话 */
-interface PendingTurn {
+/** 已提交、等待对应轮次开始的请求（与 agent next-turn inbox 顺序一一对应） */
+interface QueuedRequest {
     connection: TurnConnection
     requestId: RequestId
-    text: string
 }
 
 /** 驱动一轮对话所需的最小连接接口（便于测试替身） */
@@ -97,11 +101,13 @@ export interface TurnConnection {
 
 /**
  * 会话驱动器：一个 DSH 会话（serviceIndex-appUserId）对应一个实例。
- * 串行驱动多轮对话（agent inbox 语义为 next-turn），事件按发起连接转译回推。
+ * 排队交由 agent 的 next-turn inbox（followup 语义）：每条消息直接 followup，
+ * agent 在当前轮结束后按序自动开始下一轮；本类只负责按 turn/start 顺序把
+ * 轮次事件映射回发起请求的连接。
  */
 export class SessionDriver {
     private activeTurn: { connection: TurnConnection; translator: TurnTranslator } | undefined
-    private readonly pendingTurns: PendingTurn[] = []
+    private readonly queuedRequests: QueuedRequest[] = []
 
     constructor(
         public readonly sessionId: SessionId,
@@ -109,37 +115,47 @@ export class SessionDriver {
     ) {}
 
     get isActive(): boolean {
-        return this.activeTurn !== undefined
+        return this.activeTurn !== undefined || this.queuedRequests.length > 0
     }
 
-    /** 终端提交一轮对话：空闲立即驱动，忙时排队（上一轮 turn/end 后依序驱动） */
+    /** 终端提交一轮对话：直接交给 agent 排队（当前轮结束后自动开始），并记录对应请求 */
     submit(connection: TurnConnection, requestId: RequestId, text: string): void {
-        if (this.activeTurn) {
-            this.pendingTurns.push({ connection, requestId, text })
-            return
+        this.queuedRequests.push({ connection, requestId })
+        try {
+            this.handle.agent.followup(createUserMessage({
+                content: [{ type: 'text', text }],
+                source: { kind: 'user' },
+            }))
+        } catch (error) {
+            this.queuedRequests.pop()
+            log(`消息提交失败：${this.sessionId} ${error instanceof Error ? error.message : String(error)}`)
+            connection.sendEvent({ requestId, type: 'error', message: `消息处理失败：${error instanceof Error ? error.message : String(error)}` })
         }
-        this.startTurn(connection, requestId, text)
     }
 
     /** 会话事件入口（由 gateway 全局 session/event 订阅路由进来） */
     handleEvent(event: SessionEvent): void {
+        // 每个 turn/start 按序消费一个排队请求；无对应请求的轮次（agent 自发）没有接收方
+        if (event.type === 'turn/start') {
+            const next = this.queuedRequests.shift()
+            if (next === undefined) log(`忽略无对应请求的轮次：${this.sessionId} turn=${event.data.turn}`)
+            this.activeTurn = next === undefined
+                ? undefined
+                : { connection: next.connection, translator: new TurnTranslator(next.requestId) }
+        }
         const activeTurn = this.activeTurn
         if (!activeTurn) return
         for (const serverEvent of activeTurn.translator.translate(event)) {
             activeTurn.connection.sendEvent(serverEvent)
         }
-        if (activeTurn.translator.isFinished) {
-            this.activeTurn = undefined
-            const next = this.pendingTurns.shift()
-            if (next) this.startTurn(next.connection, next.requestId, next.text)
-        }
+        if (activeTurn.translator.isFinished) this.activeTurn = undefined
     }
 
-    /** 丢弃未开始的排队请求（连接断开时调用） */
+    /** 丢弃尚未开始的排队请求（连接断开时调用；已 followup 的消息由 agent 自行消费） */
     dropPending(connection: TurnConnection): void {
-        for (let index = this.pendingTurns.length - 1; index >= 0; index--) {
-            if (this.pendingTurns[index].connection === connection) {
-                this.pendingTurns.splice(index, 1)
+        for (let index = this.queuedRequests.length - 1; index >= 0; index--) {
+            if (this.queuedRequests[index].connection === connection) {
+                this.queuedRequests.splice(index, 1)
             }
         }
     }
@@ -147,20 +163,7 @@ export class SessionDriver {
     /** 停止驱动并销毁 agent（会话保留期到期时调用） */
     async dispose(): Promise<void> {
         this.activeTurn = undefined
-        this.pendingTurns.length = 0
+        this.queuedRequests.length = 0
         await this.handle.dispose()
-    }
-
-    private startTurn(connection: TurnConnection, requestId: RequestId, text: string): void {
-        this.activeTurn = { connection, translator: new TurnTranslator(requestId) }
-        try {
-            this.handle.agent.followup(createUserMessage({
-                content: [{ type: 'text', text }],
-                source: { kind: 'user' },
-            }))
-        } catch (error) {
-            this.activeTurn = undefined
-            connection.sendEvent({ requestId, type: 'error', message: `消息处理失败：${error instanceof Error ? error.message : String(error)}` })
-        }
     }
 }
