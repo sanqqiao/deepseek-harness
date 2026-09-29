@@ -11,7 +11,10 @@
 #   ./dsh-server.sh ask "任务"     前台一次性执行任务（headless 单次问答）
 # 环境变量：
 #   DSH_PROFILE  启动的 profile（默认 web；headless 用于单次问答，不适合常驻）
-#   DEEPSEEK_API_KEY  LLM 凭证（也可用 credentials 服务持久化）
+#   DSH_HOST     监听地址（默认 127.0.0.1 仅本机；0.0.0.0 被服务端安全策略禁止）
+#   DSH_TRUSTED_HOSTS  额外信任的 authority（空格分隔 host 或 host:port），供反代/局域网访问 /api
+#   DSH_PATCH          额外的 --patch overlay（如 ./dsh-cmis-agent/cordis.yml 加载 cmis 插件）
+#   DEEPSEEK_API_KEY   LLM 凭证（也可用 credentials 服务持久化）
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -25,7 +28,19 @@ else
     APP_HOME=$DSH_APP_HOME
 fi
 PROFILE=${DSH_PROFILE:-web}
-export PATH="$HOME/node24/bin:$PATH"
+# node 探测：优先 ~/node24（服务器），其次 nvm 当前版本（本机），最后系统 PATH（需 >=22）
+if [[ -x $HOME/node24/bin/node ]]; then
+    NODE_BIN=$HOME/node24/bin/node
+elif [[ -n ${NVM_BIN:-} && -x $NVM_BIN/node ]]; then
+    NODE_BIN=$NVM_BIN/node
+elif [[ -x $HOME/node22/bin/node ]]; then
+    NODE_BIN=$HOME/node22/bin/node
+elif command -v node >/dev/null 2>&1; then
+    NODE_BIN=$(command -v node)
+else
+    echo "错误: 未找到 node（需 >=22）"; exit 1
+fi
+export PATH="$(dirname "$NODE_BIN"):$PATH"
 PID_FILE=$APP_HOME/dsh-server.pid
 LOG_FILE=$APP_HOME/dsh-server.log
 
@@ -62,8 +77,19 @@ cmd_start() {
     if [[ ! -f packages/bundle/headless/lib/index.js || ! -f native/system/packages/linux-x64/bin/glibc/system.node || ! -f apps/web/dist/index.html ]]; then
         cmd_build
     fi
-    log "后台启动 profile=$PROFILE"
-    nohup "$HOME/node24/bin/node" --import tsx/esm dsh.mjs --profile "$PROFILE" \
+    # DSH_PATCH 指定的 overlay 存在才附加
+    local patch_args=()
+    if [[ -n ${DSH_PATCH:-} ]]; then
+        for p in $DSH_PATCH; do
+            [[ -f $APP_HOME/$p || -f $p ]] || { log "错误: patch 不存在: $p"; exit 1; }
+            patch_args+=(--patch "$p")
+        done
+    fi
+    log "后台启动 profile=$PROFILE host=${DSH_HOST:-127.0.0.1} patch=${DSH_PATCH:-none}"
+    nohup "$NODE_BIN" --import tsx/esm dsh.mjs --profile "$PROFILE" \
+        ${DSH_HOST:+--host "$DSH_HOST"} \
+        ${DSH_TRUSTED_HOSTS:+$(printf -- '--trusted-host %s ' $DSH_TRUSTED_HOSTS)} \
+        "${patch_args[@]}" \
         >> "$LOG_FILE" 2>&1 &
     local pid=$!
     echo "$pid" > "$PID_FILE"
@@ -114,7 +140,7 @@ cmd_logs() {
 
 cmd_ask() {
     cd "$APP_HOME"
-    exec "$HOME/node24/bin/node" --import tsx/esm dsh.mjs --profile "$PROFILE" "$@"
+    exec "$NODE_BIN" --import tsx/esm dsh.mjs --profile "$PROFILE" "$@"
 }
 
 case ${1:-} in
