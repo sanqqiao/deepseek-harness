@@ -16,6 +16,11 @@ import type { CmisContext } from '../context/index.ts'
 export const name = 'cmis-gateway'
 export const inject = ['cmisContext', 'agents', 'agentDefaultModel', 'sessionPersistence']
 
+/** 运行期日志：直接写 stdout，确保在 dsh-server.log 中可见（ctx.logger 在网关运行期不落盘） */
+const log = (message: string): void => {
+    process.stdout.write(`[cmis-gateway] ${message}\n`)
+}
+
 export const defaultWelcomeText = `欢迎使用信步AI报表助手！我是您的智能报表查询助手。
 
 您可以通过文字告诉我想看的报表，例如"查一下上周的滞销品报表"。
@@ -100,6 +105,7 @@ export function apply(ctx: Context, config: Config) {
         for (;;) {
             const existing = drivers.get(key)
             if (existing) {
+                log(`复用已有会话：${key}`)
                 // 重连复用：取消保留期销毁
                 const timer = retentionTimers.get(key)
                 if (timer) {
@@ -129,6 +135,7 @@ export function apply(ctx: Context, config: Config) {
         const sessionId = buildSessionId(serviceIndex, businessType, appUserId)
         const persistence = ctx.get('sessionPersistence')
         const persisted = persistence !== undefined && (await persistence.list()).some((item: { header: { id: string } }) => item.header.id === sessionId)
+        log(`会话${persisted ? '恢复(resume)' : '新建(create)'}：${sessionId}`)
         if (persisted) {
             const resumed = await ctx.agents.resume({
                 resumeSessionId: sessionId,
@@ -162,16 +169,19 @@ export function apply(ctx: Context, config: Config) {
                 return
             }
             drivers.delete(sessionId)
+            log(`保留期到期，销毁会话：${sessionId}`)
             // 销毁过程登记为会话迁移：销毁期间的重连等待完成后按磁盘历史 resume，避免与未释放完的旧会话撞 id
             const disposing = driver.dispose().catch((error) => {
                 ctx.logger.warn(`[cmis-gateway] 销毁会话 "${sessionId}" 失败：${error instanceof Error ? error.message : String(error)}`)
             })
             sessionTransitions.set(sessionId, disposing)
             void disposing.finally(() => {
+                log(`会话已销毁：${sessionId}`)
                 if (sessionTransitions.get(sessionId) === disposing) sessionTransitions.delete(sessionId)
             })
         }, config.sessionRetentionMs)
         retentionTimers.set(sessionId, timer)
+        log(`会话进入保留期（${config.sessionRetentionMs}ms）：${sessionId}`)
     }
 
     /** 提交一轮文本对话（businessType 切换 → deptCode 切换 → 心跳续期 → 失效检查 → 驱动 agent） */
@@ -384,6 +394,7 @@ export function apply(ctx: Context, config: Config) {
             try {
                 const credentials = readCredentials(request.headers)
                 const authResult = await authenticate(cmisContext, credentials)
+                log(`连接鉴权通过：host=${request.headers.host ?? ''} path=${request.url ?? ''} serviceIndex=${authResult.serviceIndex} businessType=${authResult.businessType} appUserId=${authResult.appUserId}`)
                 const driver = await getOrCreateDriver(authResult.serviceIndex, authResult.businessType, authResult.appUserId)
 
                 const connection = new GatewayConnection(ws, authResult, sendMessage)
@@ -427,6 +438,7 @@ export function apply(ctx: Context, config: Config) {
                     ? error.message
                     : `连接过程中发生错误，请重试：${error instanceof Error ? error.message : String(error)}`
                 ctx.logger.warn(`[cmis-gateway] 连接处理失败：${message}`)
+                log(`连接处理失败：${message}`)
                 sendMessage(ws, { type: 'error', code: error instanceof AuthError ? 'unauthorized' : undefined, message })
                 ws.close()
             }
@@ -435,6 +447,7 @@ export function apply(ctx: Context, config: Config) {
 
     server.listen(config.port, () => {
         ctx.logger.info(`[cmis-gateway] WebSocket 服务已启动：ws://127.0.0.1:${config.port}${config.path}`)
+        log(`WebSocket 服务已启动：ws://127.0.0.1:${config.port}${config.path}`)
     })
 
     ctx.effect(() => () => {
