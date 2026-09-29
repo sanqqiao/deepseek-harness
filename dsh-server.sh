@@ -86,10 +86,12 @@ cmd_start() {
         done
     fi
     log "后台启动 profile=$PROFILE host=${DSH_HOST:-127.0.0.1} patch=${DSH_PATCH:-none}"
+    # 注意参数顺序：--patch 是 launcher 层 flag，必须放在 app 层 flag（--host/--trusted-host）之前，
+    # launcher 使用 passThroughOptions，遇到 app 层 flag 后不再解析后续 launcher flag
     nohup "$NODE_BIN" --import tsx/esm dsh.mjs --profile "$PROFILE" \
+        "${patch_args[@]}" \
         ${DSH_HOST:+--host "$DSH_HOST"} \
         ${DSH_TRUSTED_HOSTS:+$(printf -- '--trusted-host %s ' $DSH_TRUSTED_HOSTS)} \
-        "${patch_args[@]}" \
         >> "$LOG_FILE" 2>&1 &
     local pid=$!
     echo "$pid" > "$PID_FILE"
