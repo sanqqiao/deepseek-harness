@@ -4,6 +4,7 @@ import z from '@deepseek-ai/schemastery'
 import http from 'node:http'
 import { WebSocketServer, WebSocket } from 'ws'
 import { authenticate, AuthError, readCredentials } from './auth.ts'
+import type { AuthResult } from './auth.ts'
 import { buildSessionId, SessionDriver } from './bridge.ts'
 import type { TurnConnection } from './bridge.ts'
 import { XfyunRealtimeAsr } from './speech.ts'
@@ -61,13 +62,11 @@ class GatewayConnection implements TurnConnection {
 
     constructor(
         readonly ws: WebSocket,
-        readonly serviceIndex: string,
-        readonly appUserId: string,
-        businessType: string,
+        readonly auth: AuthResult,
         private readonly sendMessage: (ws: WebSocket, event: ServerEvent) => void,
     ) {
-        this.businessType = businessType
-        this.usedBusinessTypes.add(businessType)
+        this.businessType = auth.businessType
+        this.usedBusinessTypes.add(auth.businessType)
     }
 
     sendEvent(event: ServerEvent): void {
@@ -83,6 +82,8 @@ export function apply(ctx: Context, config: Config) {
     const connections = new Map<WebSocket, GatewayConnection>()
     /** sessionId → 保留期销毁定时器 */
     const retentionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+    /** sessionId → 进行中的会话创建/销毁 Promise（并发连接与保留期销毁串行化，避免同 id 重复 create/resume 冲突） */
+    const sessionTransitions = new Map<string, Promise<unknown>>()
 
     const sendMessage = (ws: WebSocket, event: ServerEvent): void => {
         if (ws.readyState !== WebSocket.OPEN) return
@@ -95,27 +96,46 @@ export function apply(ctx: Context, config: Config) {
     })
 
     const getOrCreateDriver = async (serviceIndex: string, businessType: string, appUserId: string): Promise<SessionDriver> => {
-        const sessionId = buildSessionId(serviceIndex, businessType, appUserId)
-        const existing = drivers.get(sessionId.toString())
-        if (existing) {
-            // 重连复用：取消保留期销毁
-            const timer = retentionTimers.get(sessionId.toString())
-            if (timer) {
-                clearTimeout(timer)
-                retentionTimers.delete(sessionId.toString())
+        const key = buildSessionId(serviceIndex, businessType, appUserId).toString()
+        for (;;) {
+            const existing = drivers.get(key)
+            if (existing) {
+                // 重连复用：取消保留期销毁
+                const timer = retentionTimers.get(key)
+                if (timer) {
+                    clearTimeout(timer)
+                    retentionTimers.delete(key)
+                }
+                return existing
             }
-            return existing
+            // 同会话的创建/销毁正在进行：等它结束再重查（避免并发 create/resume 撞 id）
+            const transition = sessionTransitions.get(key)
+            if (transition) {
+                await transition
+                continue
+            }
+            const creating = createDriver(key, serviceIndex, businessType, appUserId)
+            sessionTransitions.set(key, creating)
+            try {
+                return await creating
+            } finally {
+                if (sessionTransitions.get(key) === creating) sessionTransitions.delete(key)
+            }
         }
-        // 磁盘已有同 id 会话（进程重启后重连）：resume 恢复历史，避免 id collision
+    }
+
+    /** 内存无此会话：磁盘已有同 id 则 resume 恢复历史（进程重启后重连），否则新建 */
+    const createDriver = async (key: string, serviceIndex: string, businessType: string, appUserId: string): Promise<SessionDriver> => {
+        const sessionId = buildSessionId(serviceIndex, businessType, appUserId)
         const persistence = ctx.get('sessionPersistence')
-        const persisted = persistence !== undefined && (await persistence.list()).some((header: { id: string }) => header.id === sessionId)
+        const persisted = persistence !== undefined && (await persistence.list()).some((item: { header: { id: string } }) => item.header.id === sessionId)
         if (persisted) {
             const resumed = await ctx.agents.resume({
                 resumeSessionId: sessionId,
                 agentOptions: ctx.agentDefaultModel.currentSelection(),
             })
             const driver = new SessionDriver(sessionId, resumed)
-            drivers.set(sessionId.toString(), driver)
+            drivers.set(key, driver)
             return driver
         }
         const handle = await ctx.agents.create({
@@ -124,7 +144,7 @@ export function apply(ctx: Context, config: Config) {
             agentOptions: ctx.agentDefaultModel.currentSelection(),
         })
         const driver = new SessionDriver(sessionId, handle)
-        drivers.set(sessionId.toString(), driver)
+        drivers.set(key, driver)
         return driver
     }
 
@@ -142,8 +162,13 @@ export function apply(ctx: Context, config: Config) {
                 return
             }
             drivers.delete(sessionId)
-            void driver.dispose().catch((error) => {
+            // 销毁过程登记为会话迁移：销毁期间的重连等待完成后按磁盘历史 resume，避免与未释放完的旧会话撞 id
+            const disposing = driver.dispose().catch((error) => {
                 ctx.logger.warn(`[cmis-gateway] 销毁会话 "${sessionId}" 失败：${error instanceof Error ? error.message : String(error)}`)
+            })
+            sessionTransitions.set(sessionId, disposing)
+            void disposing.finally(() => {
+                if (sessionTransitions.get(sessionId) === disposing) sessionTransitions.delete(sessionId)
             })
         }, config.sessionRetentionMs)
         retentionTimers.set(sessionId, timer)
@@ -167,7 +192,7 @@ export function apply(ctx: Context, config: Config) {
             }
         }
         // 续期用户心跳（消息到达视为活跃）
-        cmisContext.touchUser(connection.serviceIndex, connection.appUserId, cmisContext.get(sessionId)?.user.userName)
+        cmisContext.touchUser(connection.auth.serviceIndex, connection.auth.appUserId, cmisContext.get(sessionId)?.user.userName)
         // 空闲超过刷新间隔：先续期用户信息（携带 Authorization，ticket 过期时下游静默重登换新票）
         if (cmisContext.needsRefresh(sessionId)) {
             try {
@@ -255,13 +280,31 @@ export function apply(ctx: Context, config: Config) {
         }
     }
 
+    /** 绑定/刷新业务会话的 cmis-context 上下文（连接建立与跨业务创建会话时调用，幂等） */
+    const bindSessionContext = (connection: GatewayConnection, sessionId: string): void => {
+        const { serviceIndex, serviceUrl, appUserId, ticket, authorization, user } = connection.auth
+        const existing = cmisContext.get(sessionId)
+        cmisContext.bind(sessionId, {
+            serviceIndex,
+            serviceUrl,
+            appUserId,
+            ticket,
+            authorization,
+            user,
+            lastShopCode: existing?.lastShopCode,
+            lastShopId: existing?.lastShopId,
+        })
+    }
+
     /** 按业务解析目标会话驱动器（业务变化时更新连接当前业务并切换，旧业务会话无其他连接使用则进入保留期） */
     const resolveDriver = async (connection: GatewayConnection, businessType?: string): Promise<SessionDriver> => {
         const target = businessType?.trim() || connection.businessType || DEFAULT_BUSINESS_TYPE
         const previous = connection.businessType
         connection.usedBusinessTypes.add(target)
         if (target !== previous) connection.businessType = target
-        const driver = await getOrCreateDriver(connection.serviceIndex, target, connection.appUserId)
+        const driver = await getOrCreateDriver(connection.auth.serviceIndex, target, connection.auth.appUserId)
+        // 跨业务动态创建的会话同样需要绑定上下文（bind 幂等，ticket 取连接最新值）
+        bindSessionContext(connection, driver.sessionId.toString())
         // 切换业务：旧业务会话无同会话其他连接时进入保留期，超时无使用则销毁
         if (target !== previous) {
             releaseDriver(previous, connection)
@@ -276,11 +319,11 @@ export function apply(ctx: Context, config: Config) {
 
     /** 释放连接对某业务会话的占用（断开或业务切换时调用；无同会话其他连接时进入保留期） */
     const releaseDriver = (businessType: string, connection: GatewayConnection): void => {
-        const sessionId = buildSessionId(connection.serviceIndex, businessType, connection.appUserId).toString()
+        const sessionId = buildSessionId(connection.auth.serviceIndex, businessType, connection.auth.appUserId).toString()
         const inUse = [...connections.values()].some((item) =>
             item !== connection
-            && item.serviceIndex === connection.serviceIndex
-            && item.appUserId === connection.appUserId
+            && item.auth.serviceIndex === connection.auth.serviceIndex
+            && item.auth.appUserId === connection.auth.appUserId
             && item.businessType === businessType,
         )
         if (!inUse) scheduleDisposal(sessionId)
@@ -342,24 +385,13 @@ export function apply(ctx: Context, config: Config) {
                 const credentials = readCredentials(request.headers)
                 const authResult = await authenticate(cmisContext, credentials)
                 const driver = await getOrCreateDriver(authResult.serviceIndex, authResult.businessType, authResult.appUserId)
-                const sessionId = driver.sessionId.toString()
 
-                // 绑定/刷新 cmis-context 会话上下文
-                const existing = cmisContext.get(sessionId)
-                cmisContext.bind(sessionId, {
-                    serviceIndex: authResult.serviceIndex,
-                    serviceUrl: authResult.serviceUrl,
-                    appUserId: authResult.appUserId,
-                    ticket: authResult.ticket,
-                    authorization: authResult.authorization,
-                    user: authResult.user,
-                    lastShopCode: existing?.lastShopCode,
-                    lastShopId: existing?.lastShopId,
-                })
-                cmisContext.touchUser(authResult.serviceIndex, authResult.appUserId, authResult.user.userName)
-
-                const connection = new GatewayConnection(ws, authResult.serviceIndex, authResult.appUserId, authResult.businessType, sendMessage)
+                const connection = new GatewayConnection(ws, authResult, sendMessage)
                 connections.set(ws, connection)
+
+                // 绑定/刷新初始业务会话的 cmis-context 上下文，并登记在线用户
+                bindSessionContext(connection, driver.sessionId.toString())
+                cmisContext.touchUser(authResult.serviceIndex, authResult.appUserId, authResult.user.userName)
 
                 // 心跳推送（小程序环境无法访问协议层 pong 帧，走应用层心跳）
                 let heartbeatTimer: ReturnType<typeof setInterval> | undefined
@@ -381,11 +413,11 @@ export function apply(ctx: Context, config: Config) {
                     connection.activeSpeech = undefined
                     // 各业务会话逐一释放：丢弃排队请求，无同会话的其他连接时进入保留期，超时无重连则销毁 agent
                     for (const businessType of collectConnectionBusinessTypes(connection)) {
-                        const sessionId = buildSessionId(connection.serviceIndex, businessType, connection.appUserId).toString()
+                        const sessionId = buildSessionId(connection.auth.serviceIndex, businessType, connection.auth.appUserId).toString()
                         drivers.get(sessionId)?.dropPending(connection)
                         releaseDriver(businessType, connection)
                     }
-                    cmisContext.removeUser(connection.serviceIndex, connection.appUserId)
+                    cmisContext.removeUser(connection.auth.serviceIndex, connection.auth.appUserId)
                 })
                 ws.on('error', () => ws.close())
 
@@ -394,6 +426,7 @@ export function apply(ctx: Context, config: Config) {
                 const message = error instanceof AuthError
                     ? error.message
                     : `连接过程中发生错误，请重试：${error instanceof Error ? error.message : String(error)}`
+                ctx.logger.warn(`[cmis-gateway] 连接处理失败：${message}`)
                 sendMessage(ws, { type: 'error', code: error instanceof AuthError ? 'unauthorized' : undefined, message })
                 ws.close()
             }
