@@ -46,3 +46,5 @@ worktrees/
 .agents/worktrees/
 .typert-*/
 native/system/test/bin/
+dsh-server.log
+dsh-server.pid
