@@ -44,6 +44,9 @@ async function postJson<T = unknown>(
 
 /**
  * 实时查询报表数据。
+ * cmis-report 报表服务签名为 (menu, condition, page, user)，参数需包装为
+ * condition.conditionItems 结构（startDate/endDate/unsoldDays 等由服务端
+ * buildQueryContext 提入 cacheParams）。
  *
  * @param sessionContext 会话上下文（serviceUrl/ticket）
  * @param path 报表接口路径（如 /report/buyer/unsoldProductReport.do）
@@ -58,7 +61,8 @@ export function queryReport(
     page?: PageParam,
     signal?: AbortSignal,
 ): Promise<SimpleReturn> {
-    return postJson(sessionContext, `/simple-report${path}`, params, page, signal)
+    const conditionItems = Object.entries(params).map(([name, value]) => ({ name, value }))
+    return postJson(sessionContext, `/simple-report${path}`, { condition: { conditionItems } }, page, signal)
 }
 
 /**

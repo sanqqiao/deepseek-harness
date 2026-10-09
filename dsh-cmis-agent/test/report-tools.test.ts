@@ -255,6 +255,12 @@ test('query_report：缓存未命中回退实时查询', async () => {
         assert.ok(realtimeCall, '应调用实时查询接口')
         assert.equal(realtimeCall.headers['Simple-Ticket'], 'ticket-a')
         assert.ok(realtimeCall.headers['Simple-Page'])
+
+        // 请求体为 condition.conditionItems 结构（cmis-report 报表服务签名 (menu, condition, page, user)）
+        const body = JSON.parse(realtimeCall.body as string) as { condition: { conditionItems: { name: string; value: unknown }[] } }
+        assert.ok(Array.isArray(body.condition?.conditionItems), '请求体应包含 condition.conditionItems')
+        const startItem = body.condition.conditionItems.find((item) => item.name === 'startDate')
+        assert.equal(startItem?.value, '2026-08-17')
     } finally {
         fetchStub.restore()
     }
