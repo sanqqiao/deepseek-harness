@@ -56,13 +56,40 @@ interface PageInfoLike {
 export interface ReportResultData {
     reportCode: string
     reportName: string
+    /** 报表 HTTP 接口路径（前端弹层分页直连用，如 /report/buyer/unsoldProductReport.do） */
+    queryPath?: string
     params: Record<string, JsonValue>
+    /** 缓存控制参数（nested 报表的 nestedPath 等，前端分页直连时原样回传服务端） */
+    cache?: Record<string, JsonValue> | null
     columns?: Record<string, JsonValue>[] | null
     rows: ReportRow[]
     summary?: Record<string, JsonValue> | null
+    /** 汇总指标卡（前端面板顶部横排展示，如滞销商品数/批次总数/滞销天数） */
+    summaryItems?: { label: string; value: JsonValue; format?: string }[] | null
     page: JsonValue
     dataSource: 'cache' | 'realtime'
     cacheUpdatedAt: string | null
+}
+
+/**
+ * 从 nested 汇总行提取指标卡（如 {unsoldDays:30, totalCount:2252, totalBatchCount:2767}），
+ * 键名经列定义翻译为中文 label；无汇总行返回 null。
+ */
+export function buildSummaryItems(
+    rows: ReportRow[],
+    columns?: ReportColumnDef[],
+): { label: string; value: JsonValue; format?: string }[] | null {
+    const row = rows.find(
+        (item) => Object.values(item).some((value) => value !== null && typeof value === 'object'),
+    )
+    if (!row) return null
+    const labelOf = (field: string) => columns?.find((col) => col.field === field)?.label ?? field
+    return Object.entries(row)
+        .filter(([, value]) => value !== null && typeof value !== 'object')
+        .map(([field, value]) => {
+            const def = columns?.find((col) => col.field === field)
+            return { label: labelOf(field), value, ...(def?.format ? { format: def.format } : {}) }
+        })
 }
 
 /** 把日期值（Date/ISO 字符串/YYYY-MM-DD）归一到天粒度时间戳 */
@@ -378,10 +405,15 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
             if (dataSource === 'realtime') {
                 let resp: SimpleReturn
                 try {
+                    // nested 报表实时查询同样走 nestedPath 展开明细行（与缓存路径一致），
+                    // 否则返回的是 {items:{cnt}} 形态的汇总行，前端表格无法按列渲染
+                    const nestedPath = report.cache?.mode === 'nested' && report.cache.detailColumn
+                        ? [{ column: report.cache.detailColumn }]
+                        : undefined
                     resp = await queryReport(
                         session.context,
                         report.path,
-                        params,
+                        nestedPath ? { ...params, cache: { nestedPath } } : params,
                         { currentPage: page, pageSize } satisfies PageParam,
                         exec.signal,
                     )
@@ -419,6 +451,9 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                 ? `数据来源：预计算缓存（${cachePeriod}），生成时间 ${cacheUpdatedAt}`
                 : '数据来源：实时查询'
 
+            // nested 汇总行（rows 为 [{汇总键值..., items:{cnt}}] 形态）提取指标卡给前端
+            const summaryItems = buildSummaryItems(rows, report.columns)
+
             return {
                 success: true,
                 reportName: report.reportName,
@@ -435,7 +470,11 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                 resultData: {
                     reportCode: report.reportCode,
                     reportName: report.reportName,
+                    queryPath: report.path,
                     params,
+                    cache: report.cache?.mode === 'nested' && report.cache.detailColumn
+                        ? { nestedPath: [{ column: report.cache.detailColumn }] }
+                        : null,
                     columns: report.columns?.map((col): Record<string, JsonValue> => {
                         const out: Record<string, JsonValue> = { field: col.field, label: col.label }
                         if (col.format !== undefined) out.format = col.format
@@ -443,6 +482,7 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                     }) ?? null,
                     rows,
                     summary: summary ?? null,
+                    summaryItems,
                     page: respPage
                         ? {
                             totalRows: respPage.totalRows ?? null,

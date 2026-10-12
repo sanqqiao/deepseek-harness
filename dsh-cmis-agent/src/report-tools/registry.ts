@@ -57,6 +57,7 @@ export const columnDict: Record<string, ReportColumnDef> = {
     minBatchDate: { field: 'minBatchDate', label: '最早批次日期' },
     maxBatchDate: { field: 'maxBatchDate', label: '最晚批次日期' },
     unsoldDays: { field: 'unsoldDays', label: '滞销天数', format: 'days' },
+    totalCount: { field: 'totalCount', label: '商品数' },
     turnoverDays: { field: 'turnoverDays', label: '周转天数', format: 'days' },
     newProductDays: { field: 'newProductDays', label: '新品天数', format: 'days' },
     batchno: { field: 'batchno', label: '批号' },
