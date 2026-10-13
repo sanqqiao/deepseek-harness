@@ -402,14 +402,15 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
             }
 
             // 回退实时查询
+            let realtimeSummaryRows: ReportRow[] = []
             if (dataSource === 'realtime') {
+                // nested 报表实时查询同样走 nestedPath 展开明细行（与缓存路径一致），
+                // 否则返回的是 {items:{cnt}} 形态的汇总行，前端表格无法按列渲染
+                const nestedPath = report.cache?.mode === 'nested' && report.cache.detailColumn
+                    ? [{ column: report.cache.detailColumn }]
+                    : undefined
                 let resp: SimpleReturn
                 try {
-                    // nested 报表实时查询同样走 nestedPath 展开明细行（与缓存路径一致），
-                    // 否则返回的是 {items:{cnt}} 形态的汇总行，前端表格无法按列渲染
-                    const nestedPath = report.cache?.mode === 'nested' && report.cache.detailColumn
-                        ? [{ column: report.cache.detailColumn }]
-                        : undefined
                     resp = await queryReport(
                         session.context,
                         report.path,
@@ -439,6 +440,28 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                 summary = resp.sum && typeof resp.sum === 'object' && !Array.isArray(resp.sum)
                     ? resp.sum as Record<string, JsonValue>
                     : null
+
+                // nested 报表明细查询后补一次汇总查询（不带 nestedPath，取 1 行汇总数据），
+                // 供前端汇总指标卡；失败不阻塞明细展示
+                if (nestedPath) {
+                    try {
+                        const summaryResp = await queryReport(
+                            session.context,
+                            report.path,
+                            params,
+                            { currentPage: 1, pageSize: 1 } satisfies PageParam,
+                            exec.signal,
+                        )
+                        if (summaryResp.flag === ResponseFlag.SUCCESS && summaryResp.data) {
+                            const summaryData = summaryResp.data
+                            realtimeSummaryRows = Array.isArray(summaryData)
+                                ? summaryData as ReportRow[]
+                                : [summaryData as ReportRow]
+                        }
+                    } catch (error) {
+                        console.warn('[query_report] nested 汇总查询失败:', error)
+                    }
+                }
             }
 
             // markdown 表格给 LLM 组织回复（截断防止超长）
@@ -451,8 +474,12 @@ export function createQueryReportTool(cmisContext: CmisContext): ToolDefinition 
                 ? `数据来源：预计算缓存（${cachePeriod}），生成时间 ${cacheUpdatedAt}`
                 : '数据来源：实时查询'
 
-            // nested 汇总行（rows 为 [{汇总键值..., items:{cnt}}] 形态）提取指标卡给前端
-            const summaryItems = buildSummaryItems(rows, report.columns)
+            // nested 汇总行提取指标卡给前端：实时路径用补充的汇总查询结果，
+            // 缓存路径 rows 本身即汇总行（含 items 对象值）
+            const summaryItems = buildSummaryItems(
+                realtimeSummaryRows.length > 0 ? realtimeSummaryRows : rows,
+                report.columns,
+            )
 
             return {
                 success: true,

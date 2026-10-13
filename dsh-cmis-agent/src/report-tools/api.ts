@@ -46,11 +46,13 @@ async function postJson<T = unknown>(
  * 实时查询报表数据。
  * cmis-report 报表服务签名为 (menu, condition, page, user)，参数需包装为
  * condition.conditionItems 结构（startDate/endDate/unsoldDays 等由服务端
- * buildQueryContext 提入 cacheParams）。
+ * buildQueryContext 提入 cacheParams）；params 中的 cache 键为缓存控制参数
+ * （如 nestedPath），作为 condition 顶层字段传递（parseCondition 识别 rawBody.cache），
+ * 不得混入 conditionItems。
  *
  * @param sessionContext 会话上下文（serviceUrl/ticket）
  * @param path 报表接口路径（如 /report/buyer/unsoldProductReport.do）
- * @param params 查询参数（startDate/endDate/deptCode 等）
+ * @param params 查询参数（startDate/endDate/deptCode 等，可含 cache）
  * @param page 分页参数
  * @param signal 取消信号
  */
@@ -61,8 +63,12 @@ export function queryReport(
     page?: PageParam,
     signal?: AbortSignal,
 ): Promise<SimpleReturn> {
-    const conditionItems = Object.entries(params).map(([name, value]) => ({ name, value }))
-    return postJson(sessionContext, `/simple-report${path}`, { condition: { conditionItems } }, page, signal)
+    const { cache, ...restParams } = params as { cache?: unknown } & Record<string, unknown>
+    const condition: Record<string, unknown> = {
+        conditionItems: Object.entries(restParams).map(([name, value]) => ({ name, value })),
+    }
+    if (cache !== undefined) condition.cache = cache
+    return postJson(sessionContext, `/simple-report${path}`, { condition }, page, signal)
 }
 
 /**
