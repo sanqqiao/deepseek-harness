@@ -13,7 +13,8 @@
 #   DSH_PROFILE  启动的 profile（默认 web；headless 用于单次问答，不适合常驻）
 #   DSH_HOST     监听地址（默认 127.0.0.1 仅本机；0.0.0.0 被服务端安全策略禁止）
 #   DSH_TRUSTED_HOSTS  额外信任的 authority（空格分隔 host 或 host:port），供反代/局域网访问 /api
-#   DSH_PATCH  启动加载的 --patch overlay（默认 ./dsh-cmis-agent/cordis.yml 加载 cmis 插件；设为空字符串跳过）
+#   DSH_PATCH  启动加载的 --patch overlay（默认 ../dsh-cmis-agent/cordis.yml 加载 cmis 插件，
+#              插件已迁移至独立仓库 /simple/works/ai/dsh-cmis-agent；设为空字符串跳过）
 #   DEEPSEEK_API_KEY   LLM 凭证（也可用 credentials 服务持久化）
 set -euo pipefail
 
@@ -28,8 +29,8 @@ else
     APP_HOME=$DSH_APP_HOME
 fi
 PROFILE=${DSH_PROFILE:-web}
-# 默认加载 cmis 插件 patch（DSH_PATCH 显式设为空字符串时跳过）
-DSH_PATCH=${DSH_PATCH-dsh-cmis-agent/cordis.yml}
+# 默认加载 cmis 插件 patch（DSH_PATCH 显式设为空字符串时跳过；插件独立仓库与本脚本平级）
+DSH_PATCH=${DSH_PATCH-../dsh-cmis-agent/cordis.yml}
 # node 探测：优先 ~/node24（服务器），其次 nvm 当前版本（本机），最后系统 PATH（需 >=22）
 if [[ -x $HOME/node24/bin/node ]]; then
     NODE_BIN=$HOME/node24/bin/node

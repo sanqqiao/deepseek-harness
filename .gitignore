@@ -48,3 +48,6 @@ worktrees/
 native/system/test/bin/
 dsh-server.log
 dsh-server.pid
+
+# cmis 插件已迁移至独立仓库（平级目录）
+dsh-cmis-agent/
